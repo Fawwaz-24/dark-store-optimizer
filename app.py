@@ -62,13 +62,44 @@ def run_cached(n_customers: int, n_candidates: int, max_distance_km: float,
     return customers, candidates, result
 
 
+@st.cache_data(show_spinner=False, max_entries=20)
+def run_assignment_sweep_cached(max_distance_km: float,
+                                orders_per_customer_day: float,
+                                contribution_per_order: float,
+                                delivery_cost_per_km_per_order: float,
+                                store_cost_per_day: float) -> pd.DataFrame:
+    """Run the required fixed benchmark: 10,000 customers, 50 candidates,
+    and maximum store caps of 2, 5, 10, 20 and 25.
+
+    The active distance limit and economics are used, but customer/candidate
+    samples are held fixed so the comparison is apples-to-apples.
+    """
+    customers = generate_customers(10000)
+    candidates = generate_candidates().iloc[:50].reset_index(drop=True)
+    economics = Economics(
+        orders_per_customer_day=float(orders_per_customer_day),
+        contribution_per_order=float(contribution_per_order),
+        delivery_cost_per_km_per_order=float(delivery_cost_per_km_per_order),
+        store_operating_cost_per_day=float(store_cost_per_day),
+    )
+    result = optimize_problem(
+        customers=customers,
+        candidates=candidates,
+        max_distance_km=float(max_distance_km),
+        economics=economics,
+        max_store_cap=25,
+        scenario_caps=(2, 5, 10, 20, 25),
+    )
+    return result["scenario_df"]
+
+
 def make_solution_map(customers: pd.DataFrame, candidates: pd.DataFrame, result: dict,
                       max_distance_km: float) -> folium.Map:
     selected = result["selected_indices"]
     assignment = result["assignments"]
     store_metrics = result["store_metrics"]
     map_center = [13.035, 80.215]
-    fmap = folium.Map(location=map_center, zoom_start=11, tiles="CartoDB positron", control_scale=True)
+    fmap = folium.Map(location=map_center, zoom_start=11, tiles="OpenStreetMap", control_scale=True)
 
     palette = [
         "#0f766e", "#2563eb", "#9333ea", "#ea580c", "#0891b2", "#be123c",
@@ -307,8 +338,20 @@ with left:
         use_container_width=True,
     )
 with right:
-    st.markdown("<div class='section-label'>2. Profit vs. maximum permitted store count</div>", unsafe_allow_html=True)
-    scenario = result["scenario_df"].copy()
+    st.markdown("<div class='section-label'>2. Required profit sweep: 2, 5, 10, 20 and 25 stores</div>", unsafe_allow_html=True)
+    # Reuse the current run's scenario curve when the main settings are exactly
+    # the assignment benchmark; otherwise run a dedicated, fixed 10k x 50 sweep.
+    if used["n_customers"] == 10000 and used["n_candidates"] == 50:
+        scenario = result["scenario_df"].copy()
+    else:
+        with st.spinner("Running the required 10,000-customer / 50-candidate sweep…"):
+            scenario = run_assignment_sweep_cached(
+                used["max_distance"],
+                used["orders_per_customer_day"],
+                used["contribution_per_order"],
+                used["delivery_cost_per_km"],
+                used["store_cost_per_day"],
+            ).copy()
     scenario["Profit (₹ lakh/day)"] = scenario["Daily profit (₹)"] / 100000.0
     fig = px.line(
         scenario,
@@ -324,19 +367,30 @@ with right:
             "Profit (₹ lakh/day)": False,
         },
         labels={"Store cap": "Maximum stores allowed", "Profit (₹ lakh/day)": "Net expected daily profit (₹ lakh)"},
-        title="10,000 customers / 50 candidates by default; updates with the chosen scenario",
+        title=f"Fixed benchmark: 10,000 customers · 50 candidate sites · {used['max_distance']:.1f} km limit",
     )
     fig.update_traces(line_width=3, marker_size=10, textposition="top center")
     fig.update_layout(template="plotly_white", height=360, margin=dict(l=10, r=10, t=65, b=10), legend_title_text="")
     st.plotly_chart(fig, use_container_width=True)
+    sweep_table = scenario[["Store cap", "Effective cap", "Stores opened", "Customers served", "Daily profit (₹)"]].rename(
+        columns={"Daily profit (₹)": "Net profit / day (₹)"}
+    )
     st.dataframe(
-        scenario[["Store cap", "Effective cap", "Stores opened", "Customers served", "Daily profit (₹)"]].rename(
-            columns={"Daily profit (₹)": "Net profit / day (₹)"}
-        ).style.format({"Net profit / day (₹)": "₹{:,.0f}", "Customers served": "{:,.0f}"}),
+        sweep_table.style.format({"Net profit / day (₹)": "₹{:,.0f}", "Customers served": "{:,.0f}"}),
         use_container_width=True,
         hide_index=True,
     )
-    st.caption("The cap means ‘up to’ this many stores. The model may open fewer when an additional store reduces net profit.")
+    st.download_button(
+        "Download five-case profit sweep (CSV)",
+        data=sweep_table.to_csv(index=False).encode("utf-8"),
+        file_name="dark_store_profit_sweep_10000_customers_50_candidates.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.caption(
+        "This sweep always compares the five required caps on the same 10,000 synthetic customers and 50 candidate sites. "
+        "The distance limit and economics come from the last completed sidebar run. A cap means ‘up to’ that many stores."
+    )
 
 st.markdown("---")
 st.markdown("<div class='section-label'>3. Detailed geographic solution</div>", unsafe_allow_html=True)
