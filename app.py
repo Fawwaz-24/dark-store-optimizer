@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -276,7 +277,7 @@ with st.sidebar:
         store_cost_per_day = st.number_input(
             "Operating cost per store per day (₹)", min_value=0.0, max_value=100000.0, value=3500.0, step=250.0,
         )
-        submit = st.form_submit_button("Run optimization", type="primary", use_container_width=True)
+        submit = st.form_submit_button("Run optimization & refresh KPIs/map", type="primary", use_container_width=True)
 
     st.markdown(
         "<p class='small-note'>All locations, customer demand and financial values are illustrative assumptions for the assignment—not live business data.</p>",
@@ -295,6 +296,12 @@ params = {
 }
 
 if submit or "dark_store_result" not in st.session_state:
+    # Each explicit run should refresh the results rather than risk a stale cached
+    # object while a user is debugging deployment/input behaviour. The optimization
+    # remains deterministic, so the same inputs return the same solution.
+    if submit:
+        run_cached.clear()
+        run_assignment_sweep_cached.clear()
     with st.spinner("Generating Chennai demand points and optimizing dark-store locations…"):
         customers, candidates, result = run_cached(
             params["n_customers"], params["n_candidates"], params["max_distance"],
@@ -307,6 +314,7 @@ if submit or "dark_store_result" not in st.session_state:
             "candidates": candidates,
             "result": result,
             "params": params,
+            "completed_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
         }
 
 saved = st.session_state["dark_store_result"]
@@ -316,10 +324,15 @@ result = saved["result"]
 used = saved["params"]
 
 if used != params:
-    st.info("The inputs have changed. The results below show the last completed run; click **Run optimization** in the sidebar to apply the new inputs.")
+    st.info(
+        "The sidebar inputs differ from the values used for the displayed KPI table and map. "
+        "Click **Run optimization & refresh KPIs/map** to apply the new inputs. "
+        "The result table intentionally shows the last completed run until you submit the form."
+    )
 
 st.caption(
-    f"Last run: {used['n_customers']:,} customers · {used['n_candidates']} candidate sites · "
+    f"KPI table last refreshed: {saved.get('completed_at', 'session start')} · "
+    f"{used['n_customers']:,} customers · {used['n_candidates']} candidate sites · "
     f"{used['max_distance']:.1f} km service limit · at most {used['max_store_cap']} stores. "
     "Customer and candidate coordinates are synthetic and reproducible."
 )
