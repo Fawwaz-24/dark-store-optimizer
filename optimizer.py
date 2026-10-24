@@ -160,127 +160,89 @@ def _best_values(scores: np.ndarray, selected: list[int]) -> np.ndarray:
     return np.max(scores[:, selected], axis=1)
 
 
-def _capacity_assignment(scores: np.ndarray, selected: list[int],
-                         max_customers_per_store: int) -> tuple[np.ndarray, np.ndarray]:
-    """Assign customers to selected stores without exceeding store capacity.
-
-    Each customer is indivisible and has the same expected order rate. The
-    capacity in orders/day is therefore converted to a maximum number of
-    customers per store. If unconstrained nearest-best assignments are already
-    within capacity, they are retained. Otherwise a deterministic greedy
-    allocation prioritizes customers with the largest best available
-    contribution, then tries their remaining stores in descending score order.
-    """
-    n = scores.shape[0]
-    assigned_store = np.full(n, -1, dtype=int)
-    assigned_score = np.zeros(n, dtype=float)
-    if not selected or max_customers_per_store <= 0:
-        return assigned_store, assigned_score
-
-    selected_scores = scores[:, selected]
-    n_selected = len(selected)
-    local_best = np.argmax(selected_scores, axis=1)
-    best_score = selected_scores[np.arange(n), local_best]
-    served = best_score > 0
-    loads = np.bincount(local_best[served], minlength=n_selected)
-
-    # Fast path: no capacity is exceeded by the unconstrained assignment.
-    if np.all(loads <= max_customers_per_store):
-        assigned_store[served] = np.asarray(selected, dtype=int)[local_best[served]]
-        assigned_score[served] = best_score[served]
-        return assigned_store, assigned_score
-
-    # Capacity binds. Assign high-value customers first and offer each customer
-    # their best remaining selected store with spare capacity.
-    preference_order = np.argsort(-selected_scores, axis=1, kind="stable")
-    customer_priority = np.argsort(-best_score, kind="stable")
-    loads = np.zeros(n_selected, dtype=int)
-    selected_array = np.asarray(selected, dtype=int)
-    for i in customer_priority:
-        if best_score[i] <= 0:
-            break
-        for local_j in preference_order[i]:
-            value = selected_scores[i, local_j]
-            if value <= 0:
-                break
-            if loads[local_j] < max_customers_per_store:
-                assigned_store[i] = selected_array[local_j]
-                assigned_score[i] = value
-                loads[local_j] += 1
-                break
-    return assigned_store, assigned_score
-
-
-def _capacity_objective(scores: np.ndarray, selected: list[int], fixed_cost: float,
-                        max_customers_per_store: int) -> float:
-    _, contributions = _capacity_assignment(scores, selected, max_customers_per_store)
-    return float(contributions.sum() - fixed_cost * len(selected))
+def _objective(scores: np.ndarray, selected: list[int], fixed_cost: float) -> float:
+    return float(np.sum(_best_values(scores, selected)) - fixed_cost * len(selected))
 
 
 def _improve_selection(scores: np.ndarray, selected: list[int], fixed_cost: float,
-                       cap: int, max_customers_per_store: int,
-                       max_steps: int = 300) -> list[int]:
-    """Greedy capacitated facility selection with profitable store removals.
+                       cap: int, max_steps: int = 300) -> list[int]:
+    """Greedy additions followed by profitable removals and one-store swaps.
 
-    Every accepted addition or removal is evaluated with capacity-constrained
-    customer assignment and strictly increases the objective.
+    This is a deterministic local-search heuristic for the discrete facility
+    location problem. Every accepted move strictly increases the objective.
     """
     selected = list(dict.fromkeys(selected))
     m = scores.shape[1]
     eps = 1e-7
-    objective_cache: dict[tuple[int, ...], float] = {}
-
-    def obj(indices: list[int]) -> float:
-        key = tuple(sorted(indices))
-        if key not in objective_cache:
-            objective_cache[key] = _capacity_objective(scores, list(key), fixed_cost,
-                                                       max_customers_per_store)
-        return objective_cache[key]
-
     for _ in range(max_steps):
-        current_obj = obj(selected)
+        current = _best_values(scores, selected)
+        current_obj = float(current.sum() - fixed_cost * len(selected))
 
-        # First remove a redundant store if that improves capacity-aware profit.
+        # 1) Remove any redundant store if doing so improves net profit.
         best_remove_gain = eps
         remove_position = None
         for pos in range(len(selected)):
             remainder = selected[:pos] + selected[pos + 1:]
-            gain = obj(remainder) - current_obj
+            without = _best_values(scores, remainder)
+            gain = float(np.sum(without - current) + fixed_cost)
             if gain > best_remove_gain:
                 best_remove_gain, remove_position = gain, pos
         if remove_position is not None:
             selected.pop(remove_position)
             continue
 
-        # Add the candidate yielding the largest positive capacity-aware gain.
+        # 2) Add the candidate with the highest positive incremental net profit.
         if len(selected) < cap:
             best_add_gain = eps
             best_add = None
-            selected_set = set(selected)
             for j in range(m):
-                if j in selected_set:
+                if j in selected:
                     continue
-                gain = obj(selected + [j]) - current_obj
+                gain = float(np.maximum(current, scores[:, j]).sum() - current.sum() - fixed_cost)
                 if gain > best_add_gain:
                     best_add_gain, best_add = gain, j
             if best_add is not None:
                 selected.append(best_add)
                 continue
+
+        # 3) Try all one-for-one swaps. Opening cost cancels for a swap.
+        if selected and len(selected) < m:
+            best_swap_gain = eps
+            best_swap = None
+            selected_set = set(selected)
+            for pos in range(len(selected)):
+                remainder = selected[:pos] + selected[pos + 1:]
+                base = _best_values(scores, remainder)
+                for j in range(m):
+                    if j in selected_set:
+                        continue
+                    gain = float(np.maximum(base, scores[:, j]).sum() - current.sum())
+                    if gain > best_swap_gain:
+                        best_swap_gain, best_swap = gain, (pos, j)
+            if best_swap is not None:
+                pos, j = best_swap
+                selected[pos] = j
+                continue
+
+        # No improving move remains within the selected neighbourhood.
         break
 
+    # Defensive feasibility check.
     if len(selected) > cap or len(set(selected)) != len(selected):
         raise RuntimeError("The optimizer returned an invalid facility selection.")
     return selected
 
 
-def solve_caps(scores: np.ndarray, fixed_cost: float, caps: Iterable[int],
-               max_customers_per_store: int) -> dict[int, list[int]]:
-    """Solve caps in ascending order, warm-starting from the prior scenario."""
+def solve_caps(scores: np.ndarray, fixed_cost: float, caps: Iterable[int]) -> dict[int, list[int]]:
+    """Solve caps in ascending order, warm-starting each scenario from the last.
+
+    Because every local-search move must improve profit, the reported profit
+    cannot fall when the permitted number of stores increases.
+    """
     snapshots: dict[int, list[int]] = {}
     selected: list[int] = []
     for cap in sorted(set(max(0, min(int(c), scores.shape[1])) for c in caps)):
-        selected = _improve_selection(scores, selected, fixed_cost, cap,
-                                      max_customers_per_store)
+        selected = _improve_selection(scores, selected, fixed_cost, cap)
         snapshots[cap] = selected.copy()
     return snapshots
 
@@ -288,22 +250,24 @@ def solve_caps(scores: np.ndarray, fixed_cost: float, caps: Iterable[int],
 def assignment_for_selection(customers: pd.DataFrame, candidates: pd.DataFrame,
                              distances_km: np.ndarray, scores: np.ndarray,
                              selected: list[int], economics: Economics,
-                             fixed_cost: float,
-                             max_orders_per_store_day: float = 300.0) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Build capacity-feasible customer assignments, store metrics and KPIs."""
+                             fixed_cost: float) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Build customer assignments, per-store metrics, and overall KPI values."""
     n = len(customers)
-    max_customers_per_store = int(np.floor(
-        max_orders_per_store_day / economics.orders_per_customer_day + 1e-12
-    ))
-    assigned_idx, assigned_contribution = _capacity_assignment(
-        scores, selected, max_customers_per_store
-    )
-    served_mask = assigned_idx >= 0
-    assigned_distance = np.full(n, np.nan, dtype=float)
-    if served_mask.any():
-        assigned_distance[served_mask] = distances_km[
-            np.arange(n)[served_mask], assigned_idx[served_mask]
-        ]
+    if selected:
+        selected_scores = scores[:, selected]
+        local_pos = np.argmax(selected_scores, axis=1)
+        best_score = selected_scores[np.arange(n), local_pos]
+        assigned_idx = np.asarray(selected, dtype=int)[local_pos]
+        served_mask = best_score > 0
+        assigned_idx = np.where(served_mask, assigned_idx, -1)
+        assigned_distance = np.full(n, np.nan, dtype=float)
+        assigned_distance[served_mask] = distances_km[np.arange(n)[served_mask], assigned_idx[served_mask]]
+        assigned_contribution = np.where(served_mask, best_score, 0.0)
+    else:
+        assigned_idx = np.full(n, -1, dtype=int)
+        assigned_distance = np.full(n, np.nan, dtype=float)
+        assigned_contribution = np.zeros(n, dtype=float)
+        served_mask = np.zeros(n, dtype=bool)
 
     assigned_names = np.full(n, "Unserved", dtype=object)
     assigned_ids = np.full(n, "", dtype=object)
@@ -333,11 +297,6 @@ def assignment_for_selection(customers: pd.DataFrame, candidates: pd.DataFrame,
             "Longitude": candidates.iloc[idx]["longitude"],
             "Customers assigned": count,
             "Expected orders/day": count * economics.orders_per_customer_day,
-            "Order capacity/day": float(max_orders_per_store_day),
-            "Capacity utilization (%)": (
-                100.0 * count * economics.orders_per_customer_day / max_orders_per_store_day
-                if max_orders_per_store_day > 0 else 0.0
-            ),
             "Customer contribution/day (₹)": contribution,
             "Operating cost/day (₹)": fixed_cost,
             "Store profit contribution/day (₹)": contribution - fixed_cost,
@@ -360,11 +319,6 @@ def assignment_for_selection(customers: pd.DataFrame, candidates: pd.DataFrame,
         "Customers unserved": n - served_n,
         "Customer coverage (%)": 100.0 * served_n / n if n else 0.0,
         "Expected orders/day": expected_orders,
-        "Store capacity (orders/day)": float(max_orders_per_store_day),
-        "Total open-store capacity (orders/day)": float(max_orders_per_store_day * len(selected_set)),
-        "Maximum store capacity utilization (%)": (
-            float(stores["Capacity utilization (%)"].max()) if not stores.empty else 0.0
-        ),
         "Mean assigned distance (km)": avg_distance,
         "Maximum assigned distance (km)": max_assigned_distance,
         "Customer contribution/day (₹)": customer_contribution,
@@ -376,8 +330,7 @@ def assignment_for_selection(customers: pd.DataFrame, candidates: pd.DataFrame,
 
 def optimize_problem(customers: pd.DataFrame, candidates: pd.DataFrame,
                      max_distance_km: float, economics: Economics,
-                     max_store_cap: int, scenario_caps: Iterable[int] = (2, 5, 10, 20, 25),
-                     max_orders_per_store_day: float = 300.0) -> dict:
+                     max_store_cap: int, scenario_caps: Iterable[int] = (2, 5, 10, 20, 25)) -> dict:
     """Construct distances/scores and optimize scenario caps plus detail cap."""
     n_candidates = len(candidates)
     max_store_cap = max(0, min(int(max_store_cap), n_candidates))
@@ -388,15 +341,11 @@ def optimize_problem(customers: pd.DataFrame, candidates: pd.DataFrame,
     scores = make_contribution_matrix(distances, max_distance_km, economics)
     requested_caps = [max(0, min(int(cap), n_candidates)) for cap in scenario_caps]
     requested_caps.append(max_store_cap)
-    max_customers_per_store = int(np.floor(
-        max_orders_per_store_day / economics.orders_per_customer_day + 1e-12
-    ))
-    snapshots = solve_caps(scores, economics.store_operating_cost_per_day,
-                           requested_caps, max_customers_per_store)
+    snapshots = solve_caps(scores, economics.store_operating_cost_per_day, requested_caps)
     selected = snapshots[max_store_cap]
     assignments, store_metrics, kpis = assignment_for_selection(
         customers, candidates, distances, scores, selected, economics,
-        economics.store_operating_cost_per_day, max_orders_per_store_day,
+        economics.store_operating_cost_per_day,
     )
 
     # Scenario curve always uses the standard assignment caps requested.
@@ -404,14 +353,12 @@ def optimize_problem(customers: pd.DataFrame, candidates: pd.DataFrame,
     for original_cap in scenario_caps:
         effective_cap = max(0, min(int(original_cap), n_candidates))
         scenario_selected = snapshots[effective_cap]
-        _, scenario_contributions = _capacity_assignment(
-            scores, scenario_selected, max_customers_per_store
-        )
-        scenario_obj = float(
-            scenario_contributions.sum()
-            - economics.store_operating_cost_per_day * len(scenario_selected)
-        )
-        scenario_served = int((scenario_contributions > 0).sum())
+        scenario_obj = _objective(scores, scenario_selected, economics.store_operating_cost_per_day)
+        if scenario_selected:
+            scenario_best = _best_values(scores, scenario_selected)
+            scenario_served = int((scenario_best > 0).sum())
+        else:
+            scenario_served = 0
         scenario_rows.append({
             "Store cap": int(original_cap),
             "Effective cap": effective_cap,
@@ -430,6 +377,4 @@ def optimize_problem(customers: pd.DataFrame, candidates: pd.DataFrame,
         "kpis": kpis,
         "scenario_df": scenario_df,
         "economics": economics,
-        "max_orders_per_store_day": float(max_orders_per_store_day),
-        "max_customers_per_store": max_customers_per_store,
     }
