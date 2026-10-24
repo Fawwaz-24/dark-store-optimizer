@@ -43,7 +43,7 @@ def rupees(value: float) -> str:
 def run_cached(n_customers: int, n_candidates: int, max_distance_km: float,
                orders_per_customer_day: float, contribution_per_order: float,
                delivery_cost_per_km_per_order: float, store_cost_per_day: float,
-               max_store_cap: int, max_orders_per_store_day: float):
+               max_store_cap: int):
     customers = generate_customers(n_customers)
     candidates = generate_candidates().iloc[:n_candidates].reset_index(drop=True)
     economics = Economics(
@@ -59,7 +59,6 @@ def run_cached(n_customers: int, n_candidates: int, max_distance_km: float,
         economics=economics,
         max_store_cap=int(max_store_cap),
         scenario_caps=(2, 5, 10, 20, 25),
-        max_orders_per_store_day=float(max_orders_per_store_day),
     )
     return customers, candidates, result
 
@@ -69,8 +68,7 @@ def run_assignment_sweep_cached(max_distance_km: float,
                                 orders_per_customer_day: float,
                                 contribution_per_order: float,
                                 delivery_cost_per_km_per_order: float,
-                                store_cost_per_day: float,
-                                max_orders_per_store_day: float) -> pd.DataFrame:
+                                store_cost_per_day: float) -> pd.DataFrame:
     """Run the required fixed benchmark: 10,000 customers, 50 candidates,
     and maximum store caps of 2, 5, 10, 20 and 25.
 
@@ -92,7 +90,6 @@ def run_assignment_sweep_cached(max_distance_km: float,
         economics=economics,
         max_store_cap=25,
         scenario_caps=(2, 5, 10, 20, 25),
-        max_orders_per_store_day=float(max_orders_per_store_day),
     )
     return result["scenario_df"]
 
@@ -113,10 +110,6 @@ def make_solution_map(customers: pd.DataFrame, candidates: pd.DataFrame, result:
         "#c2410c",
     ]
     idx_to_color = {idx: palette[pos % len(palette)] for pos, idx in enumerate(selected)}
-    store_info = (
-        store_metrics.set_index("Store ID").to_dict("index")
-        if not store_metrics.empty else {}
-    )
 
     # Show the candidate pool distinctly from the open stores.
     candidate_layer = folium.FeatureGroup(name="All candidate sites", show=True)
@@ -125,14 +118,6 @@ def make_solution_map(customers: pd.DataFrame, candidates: pd.DataFrame, result:
         is_open = idx in selected_set
         color = idx_to_color.get(idx, "#8b95a5") if is_open else "#8b95a5"
         label = "OPEN STORE" if is_open else "Candidate only"
-        capacity_detail = ""
-        if is_open and row["store_id"] in store_info:
-            metric = store_info[row["store_id"]]
-            capacity_detail = (
-                f"<br>Expected orders/day: {metric['Expected orders/day']:.1f}"
-                f"<br>Capacity/day: {metric['Order capacity/day']:.0f}"
-                f"<br>Capacity utilization: {metric['Capacity utilization (%)']:.1f}%"
-            )
         folium.CircleMarker(
             location=[row["latitude"], row["longitude"]],
             radius=8 if is_open else 4,
@@ -143,8 +128,7 @@ def make_solution_map(customers: pd.DataFrame, candidates: pd.DataFrame, result:
             fill_opacity=0.95 if is_open else 0.55,
             popup=folium.Popup(
                 f"<b>{row['store_id']}: {row['store_name']}</b><br>{label}<br>"
-                f"Coordinates: {row['latitude']:.5f}, {row['longitude']:.5f}"
-                f"{capacity_detail}",
+                f"Coordinates: {row['latitude']:.5f}, {row['longitude']:.5f}",
                 max_width=300,
             ),
             tooltip=f"{row['store_id']} · {row['store_name']} · {label}",
@@ -230,7 +214,7 @@ def make_solution_map(customers: pd.DataFrame, candidates: pd.DataFrame, result:
     return fmap
 
 
-def render_kpi_table(kpis: dict, max_distance_km: float, max_orders_per_store_day: float) -> pd.DataFrame:
+def render_kpi_table(kpis: dict, max_distance_km: float) -> pd.DataFrame:
     rows = [
         ("Customer count", f"{kpis['Customers']:,}"),
         ("Candidate dark-store sites", f"{kpis['Candidate locations']:,}"),
@@ -239,10 +223,6 @@ def render_kpi_table(kpis: dict, max_distance_km: float, max_orders_per_store_da
         ("Customers unserved", f"{kpis['Customers unserved']:,}"),
         ("Customer coverage", f"{kpis['Customer coverage (%)']:.1f}%"),
         ("Expected orders per day", f"{kpis['Expected orders/day']:,.1f}"),
-        ("Capacity per dark store", f"{max_orders_per_store_day:,.0f} orders/day"),
-        ("Total capacity of open stores", f"{kpis['Total open-store capacity (orders/day)']:,.0f} orders/day"),
-        ("Maximum open-store capacity utilization", f"{kpis['Maximum store capacity utilization (%)']:.1f}%"),
-        ("Capacity constraint", "SATISFIED" if kpis['Expected orders/day'] <= kpis['Total open-store capacity (orders/day)'] + 1e-8 and kpis['Maximum store capacity utilization (%)'] <= 100 + 1e-8 else "VIOLATION"),
         ("Mean customer–store distance", f"{kpis['Mean assigned distance (km)']:.2f} km"),
         ("Maximum assigned distance", f"{kpis['Maximum assigned distance (km)']:.2f} km"),
         ("Maximum permitted distance", f"{max_distance_km:.2f} km"),
@@ -258,7 +238,7 @@ st.markdown(
     """
     <div class="hero">
       <h1>📍 Chennai Dark Store Location Optimizer</h1>
-      <p>Choose candidate sites, enforce customer service distance and store order capacity, and maximize expected daily contribution after operating costs.</p>
+      <p>Choose candidate sites, enforce a customer service radius, and maximize expected daily contribution after store operating costs.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -288,11 +268,6 @@ with st.sidebar:
             "Expected orders / customer / day", min_value=0.01, max_value=2.0, value=0.18, step=0.01,
             help="0.18 orders/day is approximately 5.4 orders per active customer per month.",
         )
-        max_orders_per_store_day = st.number_input(
-            "Maximum orders per dark store per day", min_value=50.0, max_value=5000.0,
-            value=300.0, step=50.0,
-            help="Hard throughput limit for each open store. This is an illustrative assumption; choose a value appropriate for your case.",
-        )
         contribution_per_order = st.number_input(
             "Contribution per order before delivery (₹)", min_value=10.0, max_value=1000.0, value=120.0, step=10.0,
         )
@@ -317,7 +292,6 @@ params = {
     "contribution_per_order": float(contribution_per_order),
     "delivery_cost_per_km": float(delivery_cost_per_km),
     "store_cost_per_day": float(store_cost_per_day),
-    "max_orders_per_store_day": float(max_orders_per_store_day),
     "max_store_cap": min(int(max_store_cap), int(n_candidates)),
 }
 
@@ -333,7 +307,7 @@ if submit or "dark_store_result" not in st.session_state:
             params["n_customers"], params["n_candidates"], params["max_distance"],
             params["orders_per_customer_day"], params["contribution_per_order"],
             params["delivery_cost_per_km"], params["store_cost_per_day"],
-            params["max_store_cap"], params["max_orders_per_store_day"],
+            params["max_store_cap"],
         )
         st.session_state["dark_store_result"] = {
             "customers": customers,
@@ -359,7 +333,7 @@ if used != params:
 st.caption(
     f"KPI table last refreshed: {saved.get('completed_at', 'session start')} · "
     f"{used['n_customers']:,} customers · {used['n_candidates']} candidate sites · "
-    f"{used['max_distance']:.1f} km service limit · {used['max_orders_per_store_day']:,.0f} orders/store/day capacity · at most {used['max_store_cap']} stores. "
+    f"{used['max_distance']:.1f} km service limit · at most {used['max_store_cap']} stores. "
     "Customer and candidate coordinates are synthetic and reproducible."
 )
 
@@ -367,7 +341,7 @@ kpis = result["kpis"]
 left, right = st.columns([1.0, 1.3], gap="large")
 with left:
     st.markdown("<div class='section-label'>1. Key performance indicators</div>", unsafe_allow_html=True)
-    kpi_df = render_kpi_table(kpis, used["max_distance"], used["max_orders_per_store_day"])
+    kpi_df = render_kpi_table(kpis, used["max_distance"])
     st.dataframe(kpi_df, use_container_width=True, hide_index=True, height=470)
     st.download_button(
         "Download all customer assignments (CSV)",
@@ -390,7 +364,6 @@ with right:
                 used["contribution_per_order"],
                 used["delivery_cost_per_km"],
                 used["store_cost_per_day"],
-                used["max_orders_per_store_day"],
             ).copy()
     scenario["Profit (₹ lakh/day)"] = scenario["Daily profit (₹)"] / 100000.0
     fig = px.line(
@@ -407,10 +380,7 @@ with right:
             "Profit (₹ lakh/day)": False,
         },
         labels={"Store cap": "Maximum stores allowed", "Profit (₹ lakh/day)": "Net expected daily profit (₹ lakh)"},
-        title=(
-            f"Fixed benchmark: 10,000 customers · 50 candidates · {used['max_distance']:.1f} km limit"
-            f" · {used['max_orders_per_store_day']:,.0f} orders/store/day capacity"
-        ),
+        title=f"Fixed benchmark: 10,000 customers · 50 candidate sites · {used['max_distance']:.1f} km limit",
     )
     fig.update_traces(line_width=3, marker_size=10, textposition="top center")
     fig.update_layout(template="plotly_white", height=360, margin=dict(l=10, r=10, t=65, b=10), legend_title_text="")
@@ -432,7 +402,7 @@ with right:
     )
     st.caption(
         "This sweep always compares the five required caps on the same 10,000 synthetic customers and 50 candidate sites. "
-        "The distance limit, per-store order capacity and economics come from the last completed sidebar run. A cap means ‘up to’ that many stores."
+        "The distance limit and economics come from the last completed sidebar run. A cap means ‘up to’ that many stores."
     )
 
 st.markdown("---")
@@ -454,8 +424,6 @@ else:
         store_table.style.format({
             "Latitude": "{:.5f}", "Longitude": "{:.5f}",
             "Expected orders/day": "{:,.1f}",
-            "Order capacity/day": "{:,.0f}",
-            "Capacity utilization (%)": "{:.1f}%",
             "Customer contribution/day (₹)": "₹{:,.0f}",
             "Operating cost/day (₹)": "₹{:,.0f}",
             "Store profit contribution/day (₹)": "₹{:,.0f}",
@@ -479,21 +447,18 @@ with st.expander("Model formulation, constraint and assumptions"):
     st.latex(r"\max\quad \sum_i\sum_j x_{ij}\,q_i\bigl(m-c_d d_{ij}\bigr)-f\sum_j y_j")
     st.markdown("**Constraints, including the requested maximum-distance restriction**")
     st.latex(r"\sum_j x_{ij}\leq 1\quad\forall i;\qquad x_{ij}\leq y_j\quad\forall i,j;")
-    st.latex(r"x_{ij}=0\quad\text{if }d_{ij}>D_{\max};\qquad\sum_j y_j\leq K;")
-    st.latex(r"\sum_i q_i x_{ij}\leq C y_j\quad\forall j.")
+    st.latex(r"x_{ij}=0\quad\text{if }d_{ij}>D_{\max};\qquad\sum_j y_j\leq K.")
     st.markdown(
         "Here, `q` is expected orders per customer per day, `m` is contribution per order before delivery, "
         "`c_d` is delivery cost per order per km, `d` is Haversine distance, `f` is daily store operating cost, "
-        "`D_max` is the permitted customer–store distance, `K` is the store-count cap, and `C` is the maximum orders each store can process per day. "
-        "The capacity constraint prevents assignments to an open store from exceeding its order throughput. Because each synthetic customer has the same expected order rate, the app enforces this as an integer customer limit per store, floor(C/q). "
-        "Customers outside every open store's radius, or who cannot be accommodated because stores are at capacity, remain unserved. "
-        "For a chosen set of stores, assignment uses a deterministic capacity-feasible greedy allocation; location selection uses greedy profit-improving additions/removals under that allocation. This is a heuristic, not a proof of global optimality."
+        "`D_max` is the permitted customer–store distance, and `K` is the store-count cap. Customers outside every open store's radius remain unserved. "
+        "The assignment for a chosen set of open stores is optimized by assigning each customer to the feasible store giving the highest contribution (equivalent to the nearest store under the shared economics)."
     )
     st.warning(
-        "The facility-selection problem is combinatorial. This app uses a capacity-aware greedy selection heuristic with profitable removals; "
-        "it produces a capacity-feasible solution but does not guarantee the global optimum. Scenario runs warm-start from the previous cap, so reported profit is non-decreasing as the cap increases."
+        "The facility-selection problem is combinatorial. This app uses greedy marginal-profit selection plus add/remove/one-for-one-swap local search; "
+        "it produces a feasible, locally improved solution but does not guarantee the global optimum. Scenario runs warm-start from the previous cap, so reported profit is non-decreasing as the cap increases."
     )
-    st.markdown("**Default assumptions**: 0.18 orders/customer/day; 300 orders/store/day capacity; ₹120 contribution/order before delivery; ₹5 per order per delivery-km; ₹3,500 daily fixed cost per open dark store. "
+    st.markdown("**Default assumptions**: 0.18 orders/customer/day; ₹120 contribution/order before delivery; ₹5 per order per delivery-km; ₹3,500 daily fixed cost per open dark store. "
                 "The data are synthetic for Chennai and should be replaced with geocoded customers, site costs and demand data for real decisions.")
 
 st.markdown("---")
